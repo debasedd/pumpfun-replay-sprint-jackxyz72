@@ -1,15 +1,16 @@
 // Surge — a momentum paper bot for the pump.fun bonding-curve replay.
 //
 // Idea: a fresh bonding curve is mostly noise and bundled dumps. A curve earns
-// a buy only once it has lived a while and its tape shows buyers arriving
-// faster than sellers: net SOL flowing in over a lookback window, several
-// different wallets buying, price climbing and sitting close to the window
-// high, and the inflow speeding up (second half of the window stronger than
-// the first). The first ticket is deliberately small; the bot only adds size
-// while the trade is already working, so a false start costs a few cents and
-// a real runner gets real size. Every position is sold whole on the first of
-// a hard stop, a trailing stop off its best value, a fade in flow, or a time
-// cap — no hoping, no averaging down.
+// a buy only in its first slots, once its tape shows buyers arriving faster
+// than sellers — and only if the launch itself looks clean: the creator has
+// not sold, the creator's own buy was small, and no more than a handful of
+// wallets piled in during the first slots (a launch bundled across many
+// wallets is a dump waiting to happen). The first ticket is small; the bot
+// only adds size while the trade is already working, so a false start costs
+// little and a real runner gets size. There is no take-profit and no time
+// cap: a position is ridden to completion behind a wide trailing stop, and
+// sold whole only on a hard stop or that trailing stop. Losers are many and
+// small; the few runners pay for them.
 //
 // A separate pacing loop keeps the run above the guardrails (200 fills over
 // 20 coins): if the bot's own fills or coins fall behind the elapsed share of
@@ -97,51 +98,70 @@ export interface SurgeConfig {
   paceWindowSecs: number;
   probeTicket: number;
   maxProbesLive: number;
+  /** Rug filter: veto an entry when the creator has already sold any tokens. */
+  skipIfDevSold: boolean;
+  /** Veto an entry when the creator's own buys total more than this (SOL). */
+  maxDevBuySol: number;
+  /** Veto an entry when more than this many distinct non-creator wallets bought
+   *  in the first earlyWindow slots of the curve's life (a bundled launch). */
+  maxEarlyBuyers: number;
+  /** The launch window (slots since creation) the early-buyer count covers. */
+  earlyWindow: number;
 }
 
-// Tuned on the dev window, favouring flat regions of the parameter grid over
-// the single best cell, so the bot survives an unseen final window.
+// Tuned on the dev window with the local engine port, favouring flat regions
+// of the parameter grid over the single best cell, so the bot survives an
+// unseen final window. The shape that won: buy the earliest accelerating
+// momentum (5-slot lookback, age >= 3 slots) only on launches that pass the
+// rug filter, stake 0.1 SOL, pyramid a little into strength, then ride:
+// no take-profit, no time cap — the trailing stop (armed at +100%, 15% giveback)
+// and the 30% stop are the only exits, so runners are held to completion
+// while losers are cut. Losers are many and small; a handful of runners pay.
 export const DEFAULT_CONFIG: SurgeConfig = {
-  lookback: 20,
-  minNetInflow: 1.0,
+  lookback: 5,
+  minNetInflow: 0.1,
   minBuys: 3,
   minWallets: 3,
   minRise: 0.03,
   maxRise: 1.0,
   accelRatio: 1.0,
-  nearTop: 0.95,
+  nearTop: 0.9,
   maxWalletShare: 0.9,
-  minCurveSol: 1.5,
-  maxCurveSol: 60,
-  minCurveAge: 120,
+  minCurveSol: 0.05,
+  maxCurveSol: 1000,
+  minCurveAge: 3,
   stakeCap: 0.2,
   minTicket: 0.01,
   buySlippageBps: 1500,
-  takeProfit: 0.2,
-  stopLoss: 0.12,
-  trailDrop: 0.1,
-  trailArm: 0.05,
+  takeProfit: 10,
+  stopLoss: 0.3,
+  trailDrop: 0.15,
+  trailArm: 1.0,
   fadeLookback: 10,
-  fadeOutflow: 0.3,
-  whaleSell: 3,
-  maxHoldSlots: 200,
+  fadeOutflow: 1000,
+  whaleSell: 1000,
+  maxHoldSlots: 100000,
   holdIfUp: 0.15,
   reentryGap: 200,
   maxEntriesPerCurve: 2,
   pyramidOn: true,
-  firstTicket: 0.05,
+  firstTicket: 0.1,
   addTicket: 0.05,
   addPriceStep: 0.02,
   addIfUp: 0.05,
   addMinInflow: 0.8,
   maxTicket: 1000,
   maxLive: 5,
-  maxTotalExposure: 2.5,
+  maxTotalExposure: 5,
   paceCoins: 25,
   paceFills: 240,
   paceWindowSecs: 14_400,
   probeTicket: 0.01,
   maxProbesLive: 1,
+  skipIfDevSold: true,
+  maxDevBuySol: 2.5,
+  maxEarlyBuyers: 6,
+  earlyWindow: 10,
 };
 
 const SOL = 1e9;
@@ -160,6 +180,10 @@ interface CurveLog {
   ticks: Tick[];
   entries: number;
   lastExitSlot: number;
+  creator: string | null;
+  devBuySol: number;
+  devSold: boolean;
+  earlyBuyers: Set<string>;
 }
 
 interface OpenTrade {
@@ -196,7 +220,7 @@ export function createSurgeBot(cfg: SurgeConfig = DEFAULT_CONFIG): Bot {
   const logOf = (mint: Pubkey): CurveLog => {
     let log = logs.get(mint);
     if (log === undefined) {
-      log = { born: null, ticks: [], entries: 0, lastExitSlot: -1e12 };
+      log = { born: null, ticks: [], entries: 0, lastExitSlot: -1e12, creator: null, devBuySol: 0, devSold: false, earlyBuyers: new Set() };
       logs.set(mint, log);
     }
     return log;
@@ -262,6 +286,11 @@ export function createSurgeBot(cfg: SurgeConfig = DEFAULT_CONFIG): Bot {
   const entryOk = (log: CurveLog, now: number, curveSol: number): boolean => {
     if (curveSol < cfg.minCurveSol || curveSol > cfg.maxCurveSol) return false;
     if (log.born === null || now - log.born < cfg.minCurveAge) return false;
+    // Rug filter: the creator dumping, or a launch bundled across many
+    // wallets in its first slots, is a dump waiting to happen.
+    if (cfg.skipIfDevSold && log.devSold) return false;
+    if (log.devBuySol > cfg.maxDevBuySol) return false;
+    if (log.earlyBuyers.size > cfg.maxEarlyBuyers) return false;
     const stats = windowStats(log, now);
     if (stats === null) return false;
     if (stats.buys < cfg.minBuys || stats.wallets < cfg.minWallets) return false;
@@ -289,10 +318,19 @@ export function createSurgeBot(cfg: SurgeConfig = DEFAULT_CONFIG): Bot {
           if (sessionNow === null || event.block_time > sessionNow) sessionNow = event.block_time;
         }
         if (event.event === 'CreateEvent') {
-          logOf(event.mint).born = event.slot;
+          const log = logOf(event.mint);
+          log.born = event.slot;
+          log.creator = event.creator;
         } else if (event.event === 'TradeEvent') {
           const log = logOf(event.mint);
           const sol = Number(event.sol_amount) / SOL;
+          const isDev = log.creator !== null && event.user === log.creator;
+          if (isDev) {
+            if (event.is_buy) log.devBuySol += sol;
+            else log.devSold = true;
+          } else if (event.is_buy && log.born !== null && event.slot - log.born <= cfg.earlyWindow) {
+            log.earlyBuyers.add(event.user);
+          }
           log.ticks.push({
             slot: event.slot,
             isBuy: event.is_buy,
