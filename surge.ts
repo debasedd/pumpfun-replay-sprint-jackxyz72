@@ -259,6 +259,10 @@ export function createSurgeBot(cfg: SurgeConfig = DEFAULT_CONFIG): Bot {
       lastPrice = tick.price;
     }
     if (firstPrice <= 0 || lastPrice <= 0) return null;
+    // A degenerate transplant can carry non-finite reserve ratios (0/0 or x/0):
+    // never let a NaN price through the signal — it would pass every
+    // comparison-based gate (NaN < x and NaN > x are both false).
+    if (!Number.isFinite(firstPrice) || !Number.isFinite(lastPrice) || !Number.isFinite(high)) return null;
     let biggest = 0;
     for (const v of perWallet.values()) if (v > biggest) biggest = v;
     return {
@@ -380,6 +384,10 @@ export function createSurgeBot(cfg: SurgeConfig = DEFAULT_CONFIG): Bot {
         const rq = mark ? Number(mark.real_quote_reserves) : Number(curve.real_quote_reserves);
         const tokens = Number(position.token_amount);
         const value = ((tokens * vq) / (vt + tokens) / SOL) * (1 - CURVE_TAKE) - txFee;
+        // A degenerate mark can make the value NaN; NaN comparisons are all
+        // false, so just skip exit evaluation for this batch rather than
+        // letting NaN into bestValue / latestValue.
+        if (!Number.isFinite(value)) continue;
         const cost = Number(position.cost_lamports) / SOL;
         if (value > trade.bestValue) trade.bestValue = value;
         trade.latestValue = value;
@@ -434,6 +442,10 @@ export function createSurgeBot(cfg: SurgeConfig = DEFAULT_CONFIG): Bot {
         const log = logs.get(mint)!;
         const trade = open.get(mint);
         const price = Number(curve.virtual_quote_reserves) / Number(curve.virtual_token_reserves);
+        // Degenerate reserves (zero token side) make the price NaN or Infinity;
+        // skip the curve instead of feeding it into sizing (BigInt(NaN) throws
+        // and would crash the whole run).
+        if (!Number.isFinite(price) || price <= 0) continue;
         const curveSol = Number(curve.real_quote_reserves) / SOL;
         let ticket: number;
         if (trade === undefined) {
@@ -456,6 +468,10 @@ export function createSurgeBot(cfg: SurgeConfig = DEFAULT_CONFIG): Bot {
         const sizeCap = Math.floor(Number(state.maxBuyLamports(mint))) / SOL;
         let amount = Math.min(sizeCap, ticket, cfg.maxTicket, cfg.maxTotalExposure - exposure);
         if (amount > freeSol - txFee) amount = freeSol - txFee;
+        // Never send a non-finite amount to BigInt(): a degenerate reserve
+        // transplant can make sizeCap (and hence amount) NaN or Infinity,
+        // and BigInt(NaN) throws and kills the run.
+        if (!Number.isFinite(amount)) continue;
         if (amount < cfg.minTicket) continue;
         orders.push({ side: 'buy', mint, quote_lamports: BigInt(Math.floor(amount * SOL)), max_slippage_bps: cfg.buySlippageBps });
         freeSol -= amount + txFee;
