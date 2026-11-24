@@ -51,6 +51,8 @@ export interface SurgeConfig {
   minTicket: number;
   /** Slippage allowed on buys, bps; sells always go out at 10000. */
   buySlippageBps: number;
+  /** Sell when value rises this far above cost (take-profit). */
+  takeProfit: number;
   /** Sell when value falls this far below cost. */
   stopLoss: number;
   /** Sell when value falls this far below its peak. */
@@ -100,40 +102,41 @@ export interface SurgeConfig {
 // Tuned on the dev window, favouring flat regions of the parameter grid over
 // the single best cell, so the bot survives an unseen final window.
 export const DEFAULT_CONFIG: SurgeConfig = {
-  lookback: 40,
-  minNetInflow: 0.8,
-  minBuys: 4,
-  minWallets: 4,
-  minRise: 0.04,
-  maxRise: 2.0,
-  accelRatio: 0.8,
-  nearTop: 0.93,
+  lookback: 20,
+  minNetInflow: 1.0,
+  minBuys: 3,
+  minWallets: 3,
+  minRise: 0.03,
+  maxRise: 1.0,
+  accelRatio: 1.0,
+  nearTop: 0.95,
   maxWalletShare: 0.9,
   minCurveSol: 1.5,
-  maxCurveSol: 80,
-  minCurveAge: 300,
-  stakeCap: 1.5,
+  maxCurveSol: 60,
+  minCurveAge: 120,
+  stakeCap: 0.2,
   minTicket: 0.01,
   buySlippageBps: 1500,
-  stopLoss: 0.25,
-  trailDrop: 0.35,
-  trailArm: 0.08,
-  fadeLookback: 12,
-  fadeOutflow: 0.5,
-  whaleSell: 5,
-  maxHoldSlots: 1200,
-  holdIfUp: 0.2,
+  takeProfit: 0.2,
+  stopLoss: 0.12,
+  trailDrop: 0.1,
+  trailArm: 0.05,
+  fadeLookback: 10,
+  fadeOutflow: 0.3,
+  whaleSell: 3,
+  maxHoldSlots: 200,
+  holdIfUp: 0.15,
   reentryGap: 200,
   maxEntriesPerCurve: 2,
   pyramidOn: true,
-  firstTicket: 0.08,
-  addTicket: 0.25,
-  addPriceStep: 0,
-  addIfUp: -0.02,
-  addMinInflow: 0.5,
+  firstTicket: 0.05,
+  addTicket: 0.05,
+  addPriceStep: 0.02,
+  addIfUp: 0.05,
+  addMinInflow: 0.8,
   maxTicket: 1000,
   maxLive: 5,
-  maxTotalExposure: 6,
+  maxTotalExposure: 2.5,
   paceCoins: 25,
   paceFills: 240,
   paceWindowSecs: 14_400,
@@ -344,6 +347,7 @@ export function createSurgeBot(cfg: SurgeConfig = DEFAULT_CONFIG): Bot {
         trade.latestValue = value;
         const log = logOf(mint);
         let shouldExit = trade.closing;
+        if (!shouldExit && value >= cost * (1 + cfg.takeProfit)) shouldExit = true;
         if (!shouldExit && value < cost * (1 - cfg.stopLoss)) shouldExit = true;
         if (!shouldExit && trade.bestValue >= cost * (1 + cfg.trailArm) && value < trade.bestValue * (1 - cfg.trailDrop)) shouldExit = true;
         if (!shouldExit && recentFlow(log, now, cfg.fadeLookback) < -cfg.fadeOutflow) shouldExit = true;
